@@ -3,6 +3,7 @@
 __pycache__/
 
 *.secret
+.env
 
 .ruff_cache
 .pytest_cache
