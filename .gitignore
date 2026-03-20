@@ -1,0 +1,17 @@
+.DS_Store
+.venv
+__pycache__/
+
+*.secret
+.env
+
+.ruff_cache
+.pytest_cache
+
+.direnv
+
+.lycheecache
+
+tmp
+
+**/settings.local.json.env
