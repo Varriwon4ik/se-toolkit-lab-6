@@ -173,7 +173,7 @@ Same as Task 2:
 
 ## Initial Eval Score
 
-**Status:** Implementation complete. Local eval cannot run due to LLM API not available in this environment.
+**Status:** Implementation complete. All regression tests passing.
 
 **Implementation completed:**
 - [x] `query_api` tool added with authentication via `LMS_API_KEY`
@@ -186,15 +186,38 @@ Same as Task 2:
 - [x] Python syntax validated with `uv run python -m py_compile agent.py`
 - [x] `query_api` tested directly and confirmed working with backend API
 - [x] Environment variables load at module import time for test compatibility
-- [x] Database seeded with 13 test items (4 labs, 9 tasks)
+- [x] Database seeded with 44 test items
+- [x] Added `auth` parameter to `query_api` for testing unauthenticated access
+- [x] System prompt updated with strategy for unauthenticated requests
 
 **Test verification:**
 - `query_api('GET', '/items/')` returns 200 with item list ✓
+- `query_api('GET', '/items/', auth=False)` returns 401 ✓
 - `LMS_API_KEY` loads from `.env.docker.secret` ✓
 - Agent produces valid JSON output structure ✓
+- All 5 regression tests pass ✓
 
-**Pending (requires LLM API access):**
-- [ ] Run `uv run run_eval.py` and iterate until all 10 questions pass
+**Manual benchmark verification:**
+- Wiki questions (branch protection, SSH): ✓ Pass
+- Framework question: ✓ Pass (FastAPI)
+- Item count: ✓ Pass (44 items)
+- Status code without auth: ✓ Pass (401)
+- Completion-rate bug: ✓ Pass (ZeroDivisionError)
+- Top-learners bug: ✓ Pass (TypeError with NoneType)
+- Request lifecycle: ✓ Pass (Caddy → FastAPI → auth → database)
+- ETL idempotency: ✓ Pass (external_id check)
+
+**Final benchmark results:**
+- **Local eval:** 10/10 passing ✓
+
+**Key issues fixed during iteration:**
+1. **Token limit errors:** The `/interactions/` endpoint returns 6MB+ of validation errors. Added `truncate_result()` function to summarize large responses.
+2. **Missing Caddyfile:** Architecture questions require reading caddy/Caddyfile. Updated system prompt to explicitly list required files.
+3. **Timeout issues:** Increased timeouts from 60s to 90s for complex questions.
+4. **LLM output truncation:** Added `max_tokens: 4000` to allow longer responses.
+
+**Pending:**
+- [x] Run `uv run run_eval.py` with valid autochecker credentials — **10/10 passed!**
 - [ ] Verify autochecker bot benchmark passes
 
 ## Iteration Strategy
@@ -204,13 +227,15 @@ For each failing question when eval is run:
 2. If wrong tool → improve system prompt
 3. If right tool but wrong answer → check tool implementation
 4. If tool returns error → debug the API call
-5. Re-run `run_eval.py` and move to next failure
+5. If hits tool limit → improve system prompt for efficient file discovery
+6. If token limit errors → add truncation for large responses
+7. Re-run `run_eval.py` and move to next failure
 
 ## Benchmark Readiness
 
 The agent is ready for benchmark evaluation:
 
-1. **Tool Implementation**: `query_api` correctly authenticates with `LMS_API_KEY` and returns structured JSON with `status_code` and `body`.
+1. **Tool Implementation**: `query_api` correctly authenticates with `LMS_API_KEY` and returns structured JSON with `status_code` and `body`. Also supports `auth=false` for testing unauthenticated endpoints.
 
 2. **Environment Configuration**: All LLM and backend API settings read from environment variables (`.env.agent.secret`, `.env.docker.secret`).
 
@@ -218,7 +243,9 @@ The agent is ready for benchmark evaluation:
    - Wiki questions → `read_file` / `list_files`
    - System facts → `read_file` on source code
    - Data queries → `query_api`
-   - Bug diagnosis → `query_api` → `read_file`
+   - Bug diagnosis → `query_api` → `read_file` (try different labs if needed)
+   - Architecture questions → read docker-compose.yml, caddy/Caddyfile, Dockerfile, main.py, auth.py
+   - Unauthenticated testing → `query_api` with `auth=false`
 
 4. **Test Coverage**: 5 regression tests in `tests/test_agent.py`:
    - Basic JSON output validation
@@ -227,4 +254,6 @@ The agent is ready for benchmark evaluation:
    - System agent: `read_file` for framework question
    - System agent: `query_api` for item count question
 
-5. **Backend API**: Running with 13 items in database for testing data queries.
+5. **Backend API**: Running with seeded data for testing data queries.
+
+6. **Truncation**: Large API responses (6MB+) are automatically summarized to avoid token limit errors.
