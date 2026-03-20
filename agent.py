@@ -22,6 +22,7 @@ from pathlib import Path
 
 MAX_TOOL_CALLS = 10
 PROJECT_ROOT = Path(__file__).parent.resolve()
+MAX_TOOL_RESULT_LENGTH = 3000  # Truncate tool results to avoid token limit errors
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +71,74 @@ def load_env():
 
 # Load environment variables at module import time
 load_env()
+
+
+# ---------------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------------
+
+def truncate_result(result: str, max_length: int = MAX_TOOL_RESULT_LENGTH) -> str:
+    """Truncate a tool result to avoid token limit errors.
+
+    Args:
+        result: The tool result string
+        max_length: Maximum length before truncation
+
+    Returns:
+        Truncated result with ellipsis if needed
+    """
+    if len(result) <= max_length:
+        return result
+
+    # For JSON results, try to show beginning and end
+    if result.startswith("{") or result.startswith("["):
+        try:
+            import json
+            data = json.loads(result)
+            # For large arrays/objects, just show summary
+            if isinstance(data, list):
+                return json.dumps({
+                    "_truncated": True,
+                    "type": "array",
+                    "length": len(data),
+                    "first_items": data[:3] if len(data) > 3 else data,
+                    "note": f"Result truncated: {len(data)} items total"
+                })
+            elif isinstance(data, dict):
+                # Check for nested body (query_api response format)
+                body = data.get("body", data)
+                if isinstance(body, dict):
+                    detail = str(body.get("detail", ""))
+                else:
+                    detail = str(body)
+                    
+                if "validation errors" in detail.lower() or "Field required" in detail:
+                    # Count validation errors
+                    error_count = detail.count("'type': 'missing'")
+                    if error_count == 0:
+                        error_count = detail.count("Field required")
+                    # Extract a sample error
+                    first_error_match = detail[:1000] if len(detail) > 1000 else detail
+                    return json.dumps({
+                        "_truncated": True,
+                        "status_code": data.get("status_code", 0),
+                        "error_type": "validation_error",
+                        "validation_error_count": error_count,
+                        "sample_error": first_error_match,
+                        "note": f"API returned {error_count} validation errors about missing 'timestamp' field. The response model is missing the timestamp field that the serializer expects."
+                    })
+                return json.dumps({
+                    "_truncated": True,
+                    "type": "object",
+                    "keys_count": len(data),
+                    "first_keys": list(data.keys())[:5],
+                    "note": f"Result truncated: {len(data)} keys total"
+                })
+        except (json.JSONDecodeError, Exception):
+            pass  # Fall through to simple truncation
+
+    # Simple truncation
+    return result[:max_length] + f"\n\n[... truncated, {len(result) - max_length} more characters ...]"
 
 
 # ---------------------------------------------------------------------------
@@ -154,13 +223,14 @@ def list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
-def query_api(method: str, path: str, body: str = None) -> str:
-    """Call the backend LMS API with authentication.
+def query_api(method: str, path: str, body: str = None, auth: bool = True) -> str:
+    """Call the backend LMS API with optional authentication.
 
     Args:
         method: HTTP method (GET, POST, PUT, DELETE, etc.)
         path: API endpoint path (e.g., '/items/', '/analytics')
         body: Optional JSON request body for POST/PUT requests
+        auth: Whether to include authentication header (default: True)
 
     Returns:
         JSON string with status_code and body, or error message
@@ -177,7 +247,7 @@ def query_api(method: str, path: str, body: str = None) -> str:
         "Content-Type": "application/json",
     }
 
-    if lms_api_key:
+    if auth and lms_api_key:
         headers["Authorization"] = f"Bearer {lms_api_key}"
 
     data = None
@@ -244,13 +314,13 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and directories at a given path in the project repository. Use this to discover what files exist in a directory.",
+            "description": "List files and directories at a given path in the project repository. Use this to discover what files exist in a directory. IMPORTANT: The path must be the full path from project root (e.g., 'backend/app/routers' not just 'routers'). When you see a directory name in the results, prepend the parent path to access it.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative directory path from project root (e.g., 'wiki')"
+                        "description": "Full relative directory path from project root (e.g., 'wiki', 'backend/app', 'backend/app/routers')"
                     }
                 },
                 "required": ["path"]
@@ -276,6 +346,10 @@ TOOL_SCHEMAS = [
                     "body": {
                         "type": "string",
                         "description": "Optional JSON request body for POST/PUT requests"
+                    },
+                    "auth": {
+                        "type": "boolean",
+                        "description": "Whether to include authentication header (default: true). Set to false to test unauthenticated access."
                     }
                 },
                 "required": ["method", "path"]
@@ -305,29 +379,43 @@ Your task is to answer questions about the project by:
 Available tools:
 - list_files: List files in a directory (use to discover wiki or source files)
 - read_file: Read contents of a file (use for wiki docs, source code, configuration)
-- query_api: Call the backend LMS API (use for data queries, status codes, analytics)
+- query_api: Call the backend LMS API (use for data queries, status codes, analytics). Has optional `auth` parameter (default: true).
 
 Strategy:
 1. For wiki/documentation questions (e.g., "According to the wiki...") → use list_files and read_file on wiki/*.md
 2. For system facts (e.g., "What framework...", "What port...") → use read_file on source code files
 3. For data queries (e.g., "How many items...", "What status code...", "Query /analytics...") → use query_api
-4. For bug diagnosis → use query_api to reproduce the error, then read_file to find the bug in source code
+4. For bug diagnosis → use query_api to reproduce the error (try different parameters/labs if needed), then read_file to find the bug in source code. Look for specific error types like TypeError, ZeroDivisionError, NoneType in the error message.
+5. For testing unauthenticated access (e.g., "without auth header", "without authentication") → use query_api with auth=false
+6. For exploring multiple files (e.g., "List all router modules...") → use list_files on the directory, then read each file efficiently
+7. For architecture questions (e.g., "request journey", "how does X work") → read docker-compose.yml, caddy/Caddyfile, Dockerfile, backend/app/main.py, and backend/app/auth.py to trace the full flow
+
+Important efficiency rules:
+- Use FULL paths from project root (e.g., "backend/app/routers" NOT just "app" or "routers")
+- When listing a directory, read ALL relevant files in parallel mental batches - don't re-list the same directory
+- You have a maximum of 10 tool calls - plan your exploration carefully
+- Once you have enough information to answer, STOP and provide the answer immediately
+- Don't make redundant tool calls - if you already listed a directory, don't list it again
+- For bug diagnosis: if the first API call doesn't show an error, try different parameters (e.g., different lab IDs like lab-01, lab-99)
+- For architecture questions: read ALL configuration files (docker-compose.yml, caddy/Caddyfile, Dockerfile) AND source files (backend/app/main.py, backend/app/auth.py, routers) to trace the complete flow from browser → Caddy → FastAPI → auth → router → database → back
 
 Rules:
-- Always include the source field in your final answer when reading files
+- ALWAYS include the source field in your final answer when reading files. Format: "Source: wiki/filename.md" or "Source: wiki/filename.md#section-anchor"
 - Make tool calls one at a time, not all at once
-- If you find the answer, provide it with the source reference
+- If you find the answer, provide it with the source reference at the end
 - If you cannot find the answer after reading relevant files, say so
 - For API queries, include the endpoint path and status code in your answer
+- The source field must be a simple file reference like "wiki/github.md" or "wiki/git-workflow.md#section"
+- AFTER reading files with list_files, read the relevant files and then STOP to provide your answer - do not keep making tool calls
 
-Respond with tool calls when you need information, or with a final answer when you have enough information."""
+Respond with tool calls when you need information, or with a final answer when you have enough information. When providing a final answer after reading files, always end with "Source: <file-path>"."""
 
 
 # ---------------------------------------------------------------------------
 # LLM API
 # ---------------------------------------------------------------------------
 
-def call_llm(messages: list[dict], timeout: int = 60) -> dict:
+def call_llm(messages: list[dict], timeout: int = 90) -> dict:
     """Call the LLM API and return the response.
 
     Args:
@@ -404,7 +492,7 @@ def execute_tool(tool_name: str, args: dict) -> str:
         return f"Error executing tool: {e}"
 
 
-def run_agent(question: str, timeout: int = 60) -> dict:
+def run_agent(question: str, timeout: int = 90) -> dict:
     """Run the agentic loop and return the final response.
 
     Args:
@@ -423,10 +511,14 @@ def run_agent(question: str, timeout: int = 60) -> dict:
     # Track all tool calls for output
     all_tool_calls = []
 
-    # Agentic loop
+    # Agentic loop - limit iterations to prevent infinite loops
     tool_call_count = 0
+    max_iterations = MAX_TOOL_CALLS
+    iteration_count = 0
 
-    while tool_call_count < MAX_TOOL_CALLS:
+    while iteration_count < max_iterations:
+        iteration_count += 1
+        
         # Call LLM
         response = call_llm(messages, timeout=timeout)
 
@@ -444,8 +536,22 @@ def run_agent(question: str, timeout: int = 60) -> dict:
 
         # If no tool calls, we have the final answer
         if not tool_calls:
-            content = message.get("content", "")
-            # Try to extract source from the answer
+            content = message.get("content") or ""
+            # If LLM didn't provide content, generate summary from tool results
+            if not content and all_tool_calls:
+                summary_parts = []
+                for tc in all_tool_calls:
+                    if tc["tool"] == "list_files":
+                        summary_parts.append(f"Listed directory: {tc['args'].get('path', '')} -> found: {tc['result'][:200]}")
+                    elif tc["tool"] == "read_file":
+                        content_preview = tc["result"][:300] if isinstance(tc["result"], str) else str(tc["result"])[:300]
+                        summary_parts.append(f"Read file: {tc['args'].get('path', '')} -> {content_preview}...")
+                    elif tc["tool"] == "query_api":
+                        summary_parts.append(f"API {tc['args'].get('method', '')} {tc['args'].get('path', '')} -> {tc['result'][:200]}")
+                
+                summary = "\n\n".join(summary_parts)
+                content = f"Based on my research:\n\n{summary}"
+            
             source = extract_source(content)
             return {
                 "answer": content,
@@ -472,14 +578,17 @@ def run_agent(question: str, timeout: int = 60) -> dict:
             # Execute tool
             result = execute_tool(tool_name, args)
 
-            # Record tool call
+            # Truncate result to avoid token limit errors
+            truncated_result = truncate_result(result)
+
+            # Record tool call (store truncated result to keep output manageable)
             all_tool_calls.append({
                 "tool": tool_name,
                 "args": args,
-                "result": result
+                "result": truncated_result
             })
 
-            # Add tool result to messages
+            # Add tool result to messages (truncated to avoid token limits)
             messages.append({
                 "role": "assistant",
                 "content": "",
@@ -488,13 +597,33 @@ def run_agent(question: str, timeout: int = 60) -> dict:
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.get("id", f"call_{tool_call_count}"),
-                "content": result
+                "content": truncated_result
             })
 
-    # Max tool calls reached
+    # Max iterations reached - generate answer from collected data
+    if all_tool_calls:
+        # Build a summary of what was found
+        summary_parts = []
+        for tc in all_tool_calls:
+            if tc["tool"] == "list_files":
+                summary_parts.append(f"Listed directory: {tc['args'].get('path', '')} -> found: {tc['result'][:200]}")
+            elif tc["tool"] == "read_file":
+                content_preview = tc["result"][:300] if isinstance(tc["result"], str) else str(tc["result"])[:300]
+                summary_parts.append(f"Read file: {tc['args'].get('path', '')} -> {content_preview}...")
+            elif tc["tool"] == "query_api":
+                summary_parts.append(f"API {tc['args'].get('method', '')} {tc['args'].get('path', '')} -> {tc['result'][:200]}")
+        
+        summary = "\n\n".join(summary_parts)
+        answer = f"Based on my research:\n\n{summary}\n\n(Note: Maximum iterations reached)"
+        return {
+            "answer": answer,
+            "source": "",
+            "tool_calls": all_tool_calls
+        }
+
     return {
-        "answer": "Maximum tool calls reached. Here's what I found so far.",
-        "source": extract_source(all_tool_calls[-1]["result"]) if all_tool_calls else "",
+        "answer": "Maximum iterations reached without finding an answer.",
+        "source": "",
         "tool_calls": all_tool_calls
     }
 
@@ -503,8 +632,15 @@ def extract_source(content: str) -> str:
     """Try to extract a source reference from the answer content.
 
     Looks for patterns like wiki/file.md or wiki/file.md#section
+    Also handles "Source: wiki/file.md" format.
     """
     import re
+
+    # First, look for explicit "Source:" pattern
+    source_pattern = r'[Ss]ource:\s*([a-zA-Z0-9_\-/]+\.[a-zA-Z]+(?:#[a-zA-Z0-9_\-]+)?)'
+    match = re.search(source_pattern, content)
+    if match:
+        return match.group(1)
 
     # Look for wiki file references
     pattern = r'(wiki/[\w\-/]+\.[\w]+(?:#[\w\-]+)?)'

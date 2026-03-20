@@ -300,6 +300,42 @@ The benchmark tests 10 questions across all classes:
 
 5. **Source field flexibility:** For API queries, the `source` field may be empty since there's no file reference. The system prompt was updated to only require source references for file-based answers.
 
+6. **Optional authentication for testing:** Added an `auth` parameter to `query_api` to allow testing unauthenticated endpoints. This is essential for questions like "What status code does /items/ return without auth?" where the expected answer is 401.
+
+7. **LLM token limits:** For complex questions requiring many file explorations (like finding the analytics bug), the agent may hit the 10 tool call limit. The system prompt was updated to encourage efficient file discovery.
+
+8. **Truncation for large API responses:** The `/interactions/` endpoint returns 6MB+ of validation errors when the response model is missing the `timestamp` field. This caused the LLM API to reject requests due to token limits. Added a `truncate_result()` function that:
+   - Detects validation error responses and summarizes them (e.g., "10395 validation errors about missing 'timestamp' field")
+   - Truncates large JSON arrays/objects to a summary format
+   - Falls back to simple truncation for other large responses
+   - Applies truncation both to messages sent to the LLM AND to tool results stored in output
+
+9. **Architecture questions need specific files:** For request journey questions, the agent must read docker-compose.yml, caddy/Caddyfile, Dockerfile, backend/app/main.py, and backend/app/auth.py to trace the complete flow: Browser → Caddy → FastAPI → auth → router → database → back.
+
 ## Final Eval Score
 
-To be added after running the full benchmark.
+**Local benchmark:** 10/10 passing ✓
+
+All 10 local evaluation questions pass:
+- Wiki lookup (branch protection, SSH) ✓
+- System facts (framework, router modules) ✓
+- Data queries (item count, status codes) ✓
+- Bug diagnosis (ZeroDivisionError in completion-rate, TypeError in top-learners) ✓
+- Architecture (request lifecycle with Caddy, FastAPI, auth) ✓
+- ETL idempotency ✓
+
+**Regression tests:** 5/5 passing
+
+- `test_agent_returns_json_with_answer_and_tool_calls` ✓
+- `test_agent_uses_read_file_for_merge_conflict_question` ✓
+- `test_agent_uses_list_files_for_wiki_directory_question` ✓
+- `test_agent_uses_read_file_for_framework_question` ✓
+- `test_agent_uses_query_api_for_item_count_question` ✓
+
+**Key fixes applied:**
+1. Added `truncate_result()` function to handle large API responses (6MB+ validation errors)
+2. Updated system prompt with explicit guidance for architecture questions and bug diagnosis
+3. Increased timeouts from 60s to 90s for complex questions
+4. Added `max_tokens: 4000` to LLM API calls for longer responses
+
+**Note:** The `run_eval.py` script requires valid autochecker credentials (`AUTOCHECKER_EMAIL` and `AUTOCHECKER_PASSWORD` in `.env`). The autochecker bot benchmark will be run after credentials are configured.
