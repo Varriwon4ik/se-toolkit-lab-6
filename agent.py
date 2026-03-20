@@ -385,7 +385,7 @@ Strategy:
 1. For wiki/documentation questions (e.g., "According to the wiki...") → use list_files and read_file on wiki/*.md
 2. For system facts (e.g., "What framework...", "What port...") → use read_file on source code files
 3. For data queries (e.g., "How many items...", "What status code...", "Query /analytics...") → use query_api
-4. For bug diagnosis → use query_api to reproduce the error (try different parameters/labs if needed), then read_file to find the bug in source code. Look for specific error types like TypeError, ZeroDivisionError, NoneType in the error message.
+4. For bug diagnosis → use query_api to reproduce the error, then read_file to find the bug in source code. Look for specific error types like TypeError, ZeroDivisionError, NoneType in the error message. For model/schema bugs, read the relevant model files in backend/app/models/.
 5. For testing unauthenticated access (e.g., "without auth header", "without authentication") → use query_api with auth=false
 6. For exploring multiple files (e.g., "List all router modules...") → use list_files on the directory, then read each file efficiently
 7. For architecture questions (e.g., "request journey", "how does X work") → read docker-compose.yml, caddy/Caddyfile, Dockerfile, backend/app/main.py, and backend/app/auth.py to trace the full flow
@@ -398,15 +398,17 @@ Important efficiency rules:
 - Don't make redundant tool calls - if you already listed a directory, don't list it again
 - For bug diagnosis: if the first API call doesn't show an error, try different parameters (e.g., different lab IDs like lab-01, lab-99)
 - For architecture questions: read ALL configuration files (docker-compose.yml, caddy/Caddyfile, Dockerfile) AND source files (backend/app/main.py, backend/app/auth.py, routers) to trace the complete flow from browser → Caddy → FastAPI → auth → router → database → back
+- For model/schema bugs: read backend/app/models/ files to find field mismatches
 
 Rules:
-- ALWAYS include the source field in your final answer when reading files. Format: "Source: wiki/filename.md" or "Source: wiki/filename.md#section-anchor"
+- ALWAYS include the source field in your final answer when reading files. Format: "Source: wiki/filename.md" or "Source: wiki/filename.md#section-anchor" or "Source: backend/app/models/filename.py"
 - Make tool calls one at a time, not all at once
 - If you find the answer, provide it with the source reference at the end
 - If you cannot find the answer after reading relevant files, say so
 - For API queries, include the endpoint path and status code in your answer
 - The source field must be a simple file reference like "wiki/github.md" or "wiki/git-workflow.md#section"
 - AFTER reading files with list_files, read the relevant files and then STOP to provide your answer - do not keep making tool calls
+- For bug diagnosis questions, you MUST read the source code file where the bug is located and include it in the source field
 
 Respond with tool calls when you need information, or with a final answer when you have enough information. When providing a final answer after reading files, always end with "Source: <file-path>"."""
 
