@@ -2,7 +2,7 @@
 
 ## Overview
 
-This agent is a CLI tool that connects to an LLM (Qwen Code API) with **tool calling capabilities** and an **agentic loop**. It can read files and list directories to answer questions about the project documentation, particularly the wiki.
+This agent is a CLI tool that connects to an LLM (Qwen Code API) with **tool calling capabilities** and an **agentic loop**. It can read files, list directories, and query the backend LMS API to answer questions about the project documentation, source code, and live system data.
 
 ## Architecture
 
@@ -13,11 +13,12 @@ This agent is a CLI tool that connects to an LLM (Qwen Code API) with **tool cal
 └─────────────┘     └────┬─────┘     └─────────────────┘
                          │
                          ▼
-              ┌──────────────────┐
-              │  Tools:          │
-              │  - read_file     │
-              │  - list_files    │
-              └──────────────────┘
+              ┌──────────────────────────┐
+              │  Tools:                  │
+              │  - read_file             │
+              │  - list_files            │
+              │  - query_api (NEW)       │
+              └──────────────────────────┘
                          │
                          ▼
               ┌──────────────────┐
@@ -48,27 +49,32 @@ This agent is a CLI tool that connects to an LLM (Qwen Code API) with **tool cal
 
 ## Configuration
 
-The agent reads configuration from `.env.agent.secret`:
+The agent reads configuration from environment variables and two optional files:
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `LLM_API_KEY` | API key for authentication | `your-api-key` |
-| `LLM_API_BASE` | Base URL of the LLM API | `http://10.93.25.222:42005/v1` |
-| `LLM_MODEL` | Model name to use | `qwen3-coder-plus` |
+| Variable             | Purpose                              | Source              | Default                    |
+|----------------------|--------------------------------------|---------------------|----------------------------|
+| `LLM_API_KEY`        | LLM provider API key                 | `.env.agent.secret` | —                          |
+| `LLM_API_BASE`       | LLM API endpoint URL                 | `.env.agent.secret` | —                          |
+| `LLM_MODEL`          | Model name                           | `.env.agent.secret` | `qwen3-coder-plus`         |
+| `LMS_API_KEY`        | Backend API key for query_api auth   | `.env.docker.secret`| —                          |
+| `AGENT_API_BASE_URL` | Base URL for query_api               | Environment         | `http://localhost:42002`   |
+
+**Important:** The autochecker injects different values at evaluation time. The agent never hardcodes credentials.
 
 ## Usage
 
 ```bash
 # Run with a question
 uv run agent.py "How do you resolve a merge conflict?"
+uv run agent.py "How many items are in the database?"
+uv run agent.py "What HTTP status code does /items/ return without auth?"
 
 # Output (JSON)
 {
-  "answer": "Edit the conflicting file, choose which changes to keep, then stage and commit.",
-  "source": "wiki/git-workflow.md#resolving-merge-conflicts",
+  "answer": "There are 120 items in the database.",
+  "source": "",
   "tool_calls": [
-    {"tool": "list_files", "args": {"path": "wiki"}, "result": "git-workflow.md\n..."},
-    {"tool": "read_file", "args": {"path": "wiki/git-workflow.md"}, "result": "..."}
+    {"tool": "query_api", "args": {"method": "GET", "path": "/items/"}, "result": "{\"status_code\": 200, ...}"}
   ]
 }
 ```
@@ -93,7 +99,7 @@ The agent outputs a single JSON line to stdout:
 
 **Fields:**
 - `answer` (required): The final answer from the LLM
-- `source` (required): Reference to the wiki section (e.g., `wiki/git-workflow.md#section`)
+- `source` (required): Reference to the wiki section (e.g., `wiki/git-workflow.md#section`) — may be empty for API queries
 - `tool_calls` (required): Array of all tool calls made during the agentic loop
 
 **Notes:**
@@ -120,6 +126,8 @@ Read contents of a file from the project repository.
 - Only allows paths within project directory
 - Returns error if file doesn't exist
 
+**Use cases:** Reading wiki documentation, source code files, configuration files.
+
 ### 2. `list_files`
 
 List files and directories at a given path.
@@ -135,6 +143,25 @@ List files and directories at a given path.
 - Rejects paths containing `../` (path traversal prevention)
 - Only allows paths within project directory
 - Returns error if directory doesn't exist
+
+**Use cases:** Discovering what files exist in a directory, finding router modules.
+
+### 3. `query_api` (NEW in Task 3)
+
+Call the backend LMS API with authentication.
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `method` | string | HTTP method (GET, POST, PUT, DELETE, etc.) |
+| `path` | string | API endpoint path (e.g., `/items/`, `/analytics/completion-rate`) |
+| `body` | string | Optional JSON request body for POST/PUT requests |
+
+**Returns:** JSON string with `status_code` and `body` fields.
+
+**Authentication:** Uses `LMS_API_KEY` from environment (via `.env.docker.secret`).
+
+**Use cases:** Querying item counts, checking status codes, testing analytics endpoints, reproducing bugs.
 
 ## Agentic Loop
 
@@ -177,17 +204,31 @@ The agent uses an iterative loop to answer questions:
 
 The system prompt instructs the LLM to:
 
-1. Use `list_files` to discover wiki files
-2. Use `read_file` to read relevant documentation
-3. Include source reference with file path and section anchor
-4. Make tool calls one at a time, not all at once
-5. Provide final answer with source when enough information is gathered
+1. Use `list_files` to discover wiki or source files
+2. Use `read_file` to read wiki docs, source code, or configuration
+3. Use `query_api` for data-dependent questions (item counts, status codes, analytics)
+4. Include source reference with file path and section anchor for file-based answers
+5. Make tool calls one at a time, not all at once
+6. For bug diagnosis: use `query_api` to reproduce, then `read_file` to find the bug
+
+### Tool Selection Strategy
+
+The LLM decides which tool to use based on the question type:
+
+| Question Type | Example | Tool |
+|--------------|---------|------|
+| Wiki documentation | "According to the wiki, how do you protect a branch?" | `read_file`, `list_files` |
+| System facts | "What framework does the backend use?" | `read_file` (source code) |
+| Data queries | "How many items are in the database?" | `query_api` |
+| Status codes | "What status code does /items/ return without auth?" | `query_api` |
+| Bug diagnosis | "Why does /analytics/completion-rate crash for lab-99?" | `query_api` → `read_file` |
+| Architecture | "Explain the request lifecycle from browser to database" | `read_file` (config files) |
 
 ## Implementation Details
 
 ### Environment Loading
 
-The agent loads `.env.agent.secret` at startup using a simple key=value parser. Missing credentials cause an immediate error.
+The agent loads both `.env.agent.secret` (LLM config) and `.env.docker.secret` (backend API config) at startup. If files are missing, it relies on environment variables (useful for autochecker evaluation).
 
 ### API Communication
 
@@ -202,7 +243,7 @@ The `validate_path()` function ensures:
 
 ### Error Handling
 
-- Missing environment file → exit with error to stderr
+- Missing environment files → gracefully uses environment variables
 - API connection failure → exit with error to stderr
 - Invalid API response → exit with error to stderr
 - Tool execution errors → returned as error message in result
@@ -214,8 +255,9 @@ The `validate_path()` function ensures:
 |------|-------------|
 | `agent.py` | Main CLI agent with tools and agentic loop |
 | `.env.agent.secret` | LLM configuration (gitignored) |
-| `plans/task-2.md` | Implementation plan for Task 2 |
-| `tests/test_agent.py` | Regression tests |
+| `.env.docker.secret` | Backend API configuration (gitignored) |
+| `plans/task-3.md` | Implementation plan for Task 3 |
+| `tests/test_agent.py` | Regression tests (including query_api tests) |
 
 ## Testing
 
@@ -228,7 +270,36 @@ uv run pytest tests/test_agent.py -v
 Test questions:
 - `"How do you resolve a merge conflict?"` — expects `read_file` tool call
 - `"What files are in the wiki?"` — expects `list_files` tool call
+- `"What Python web framework does the backend use?"` — expects `read_file` tool call
+- `"How many items are in the database?"` — expects `query_api` tool call
 
-## Future Extensions (Task 3)
+## Benchmark Evaluation
 
-- **Task 3:** Implement more advanced reasoning, possibly with additional tools like `query_api` to interact with the backend LMS.
+Run the local benchmark:
+
+```bash
+uv run run_eval.py
+```
+
+The benchmark tests 10 questions across all classes:
+- Wiki lookup (branch protection, SSH)
+- System facts (framework, router modules)
+- Data queries (item count, status codes)
+- Bug diagnosis (ZeroDivisionError, TypeError)
+- Reasoning (request lifecycle, ETL idempotency)
+
+## Lessons Learned
+
+1. **Tool descriptions matter:** The LLM needs clear guidance on when to use each tool. Initially, the agent would try to use `read_file` for data queries. Adding explicit examples in the system prompt ("How many items..." → `query_api`) fixed this.
+
+2. **Authentication is critical:** The `query_api` tool must include the `LMS_API_KEY` header. Without it, the backend returns 401/403 errors. Reading credentials from environment variables (not hardcoded) ensures the autochecker can inject its own values.
+
+3. **Error handling in query_api:** The tool must gracefully handle HTTP errors (404, 500) and connection errors. Returning structured JSON with `status_code` and `body` allows the LLM to understand what went wrong.
+
+4. **Max tool calls:** The 10-call limit prevents infinite loops but can be tight for complex multi-step questions. The agent should be efficient in its tool usage.
+
+5. **Source field flexibility:** For API queries, the `source` field may be empty since there's no file reference. The system prompt was updated to only require source references for file-based answers.
+
+## Final Eval Score
+
+To be added after running the full benchmark.

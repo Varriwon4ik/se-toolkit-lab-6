@@ -98,3 +98,67 @@ class TestDocumentationAgent:
         # Check that list_files was used
         tools_used = [tc.get("tool") for tc in data["tool_calls"]]
         assert "list_files" in tools_used, f"Expected list_files tool call, got: {tools_used}"
+
+
+class TestSystemAgent:
+    """Test the system agent with query_api tool."""
+
+    def test_agent_uses_read_file_for_framework_question(self):
+        """Agent should use read_file tool when asked about the backend framework."""
+        result = subprocess.run(
+            [sys.executable, "agent.py", "What Python web framework does the backend use?"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        # Check exit code
+        assert result.returncode == 0, f"Agent failed: {result.stderr}"
+
+        # Parse JSON
+        try:
+            data = json.loads(result.stdout.strip())
+        except json.JSONDecodeError as e:
+            raise AssertionError(f"Agent output is not valid JSON: {result.stdout[:200]}") from e
+
+        # Check required fields
+        assert "answer" in data, "Missing 'answer' field in output"
+        assert "tool_calls" in data, "Missing 'tool_calls' field in output"
+
+        # Check that read_file was used (to read source code)
+        tools_used = [tc.get("tool") for tc in data["tool_calls"]]
+        assert "read_file" in tools_used, f"Expected read_file tool call, got: {tools_used}"
+
+        # Check that answer mentions FastAPI
+        assert "FastAPI" in data["answer"], f"Expected 'FastAPI' in answer, got: {data['answer']}"
+
+    def test_agent_uses_query_api_for_item_count_question(self):
+        """Agent should use query_api tool when asked about item count in database."""
+        result = subprocess.run(
+            [sys.executable, "agent.py", "How many items are in the database?"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        # Check exit code
+        assert result.returncode == 0, f"Agent failed: {result.stderr}"
+
+        # Parse JSON
+        try:
+            data = json.loads(result.stdout.strip())
+        except json.JSONDecodeError as e:
+            raise AssertionError(f"Agent output is not valid JSON: {result.stdout[:200]}") from e
+
+        # Check required fields
+        assert "answer" in data, "Missing 'answer' field in output"
+        assert "tool_calls" in data, "Missing 'tool_calls' field in output"
+
+        # Check that query_api was used
+        tools_used = [tc.get("tool") for tc in data["tool_calls"]]
+        assert "query_api" in tools_used, f"Expected query_api tool call, got: {tools_used}"
+
+        # Check that answer contains a number
+        import re
+        numbers = re.findall(r"\d+", data["answer"])
+        assert len(numbers) > 0, f"Expected a number in answer, got: {data['answer']}"

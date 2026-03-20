@@ -29,23 +29,47 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 # ---------------------------------------------------------------------------
 
 def load_env():
-    """Load environment variables from .env.agent.secret."""
-    env_file = Path(".env.agent.secret")
-    if not env_file.exists():
-        print("Error: .env.agent.secret not found", file=sys.stderr)
-        sys.exit(1)
+    """Load environment variables from .env.agent.secret and .env.docker.secret.
 
-    for line in env_file.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+    .env.agent.secret contains LLM configuration (LLM_API_KEY, LLM_API_BASE, LLM_MODEL).
+    .env.docker.secret contains backend API configuration (LMS_API_KEY).
+
+    Both files are optional - if missing, the agent relies on environment variables
+    (useful for autochecker evaluation).
+    """
+    # Load LLM configuration from .env.agent.secret
+    agent_env_file = Path(".env.agent.secret")
+    if agent_env_file.exists():
+        for line in agent_env_file.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+    # Load backend API configuration from .env.docker.secret
+    docker_env_file = Path(".env.docker.secret")
+    if docker_env_file.exists():
+        for line in docker_env_file.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+# Load environment variables at module import time
+load_env()
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +154,70 @@ def list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
+def query_api(method: str, path: str, body: str = None) -> str:
+    """Call the backend LMS API with authentication.
+
+    Args:
+        method: HTTP method (GET, POST, PUT, DELETE, etc.)
+        path: API endpoint path (e.g., '/items/', '/analytics')
+        body: Optional JSON request body for POST/PUT requests
+
+    Returns:
+        JSON string with status_code and body, or error message
+    """
+    import urllib.request
+    import urllib.error
+
+    api_base = os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002")
+    lms_api_key = os.environ.get("LMS_API_KEY", "")
+
+    url = f"{api_base}{path}"
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    if lms_api_key:
+        headers["Authorization"] = f"Bearer {lms_api_key}"
+
+    data = None
+    if body:
+        try:
+            data = json.dumps(json.loads(body)).encode("utf-8")
+        except json.JSONDecodeError:
+            return json.dumps({"status_code": 0, "body": "Invalid JSON body"})
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            response_body = response.read().decode("utf-8")
+            try:
+                parsed_body = json.loads(response_body)
+            except json.JSONDecodeError:
+                parsed_body = response_body
+            result = {
+                "status_code": response.status,
+                "body": parsed_body
+            }
+            return json.dumps(result)
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode() if e.fp else ""
+        try:
+            parsed_body = json.loads(error_body)
+        except json.JSONDecodeError:
+            parsed_body = error_body
+        result = {
+            "status_code": e.code,
+            "body": parsed_body
+        }
+        return json.dumps(result)
+    except urllib.error.URLError as e:
+        return json.dumps({"status_code": 0, "body": f"Connection error: {e.reason}"})
+    except Exception as e:
+        return json.dumps({"status_code": 0, "body": f"Error: {str(e)}"})
+
+
 # ---------------------------------------------------------------------------
 # Tool Schemas for LLM
 # ---------------------------------------------------------------------------
@@ -168,12 +256,38 @@ TOOL_SCHEMAS = [
                 "required": ["path"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Call the backend LMS API to query data, check status codes, or test endpoints. Use this for data-dependent questions (item counts, scores, analytics) or to check HTTP responses. Requires authentication via LMS_API_KEY.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method (GET, POST, PUT, DELETE, etc.)"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API endpoint path (e.g., '/items/', '/analytics/completion-rate')"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON request body for POST/PUT requests"
+                    }
+                },
+                "required": ["method", "path"]
+            }
+        }
     }
 ]
 
 TOOLS_MAP = {
     "read_file": read_file,
     "list_files": list_files,
+    "query_api": query_api,
 }
 
 
@@ -181,27 +295,32 @@ TOOLS_MAP = {
 # System Prompt
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a documentation assistant for a software engineering project.
+SYSTEM_PROMPT = """You are a documentation and system assistant for a software engineering project.
 
-Your task is to answer questions about the project by reading documentation files in the wiki directory.
+Your task is to answer questions about the project by:
+- Reading documentation files in the wiki directory
+- Reading source code to understand system architecture
+- Querying the backend API for data-dependent questions
 
 Available tools:
-- list_files: List files in a directory
-- read_file: Read contents of a file
+- list_files: List files in a directory (use to discover wiki or source files)
+- read_file: Read contents of a file (use for wiki docs, source code, configuration)
+- query_api: Call the backend LMS API (use for data queries, status codes, analytics)
 
 Strategy:
-1. Use list_files to discover what files exist in the wiki directory
-2. Use read_file to read relevant documentation files
-3. Find the answer in the file contents
-4. Include a source reference with the file path and section anchor (e.g., wiki/git-workflow.md#resolving-merge-conflicts)
+1. For wiki/documentation questions (e.g., "According to the wiki...") → use list_files and read_file on wiki/*.md
+2. For system facts (e.g., "What framework...", "What port...") → use read_file on source code files
+3. For data queries (e.g., "How many items...", "What status code...", "Query /analytics...") → use query_api
+4. For bug diagnosis → use query_api to reproduce the error, then read_file to find the bug in source code
 
 Rules:
-- Always include the source field in your final answer
+- Always include the source field in your final answer when reading files
 - Make tool calls one at a time, not all at once
 - If you find the answer, provide it with the source reference
 - If you cannot find the answer after reading relevant files, say so
+- For API queries, include the endpoint path and status code in your answer
 
-Respond with tool calls when you need to read files, or with a final answer when you have enough information."""
+Respond with tool calls when you need information, or with a final answer when you have enough information."""
 
 
 # ---------------------------------------------------------------------------
@@ -408,9 +527,6 @@ def main():
         sys.exit(1)
 
     question = sys.argv[1]
-
-    # Load environment configuration
-    load_env()
 
     # Run agent and get response
     response = run_agent(question)
